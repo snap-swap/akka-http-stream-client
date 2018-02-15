@@ -3,8 +3,8 @@ package com.snapswap.http.client
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.client.RequestBuilding._
-import akka.http.scaladsl.model.{HttpRequest, HttpResponse, StatusCodes}
-import akka.http.scaladsl.server.Directives.{get, path}
+import akka.http.scaladsl.model.{HttpResponse, StatusCodes}
+import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.{Directives, Route}
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream.scaladsl.{Sink, Source}
@@ -27,11 +27,11 @@ class HttpClientSpec
   import HttpClientSpec._
 
   implicit val mat: Materializer = ActorMaterializer()
-  implicit val timeout: Timeout = Timeout(30.minutes)
+  implicit val timeout: Timeout = Timeout(1.minute)
 
-  val serverRoute: Route = get(path("ping") {
+  val serverRoute: Route = get(path("ping" / Segment) { payload =>
     Directives.complete(akka.pattern.after[HttpResponse](responseDelay, system.scheduler) {
-      Future.successful(HttpResponse(StatusCodes.OK, entity = "pong"))
+      Future.successful(HttpResponse(StatusCodes.OK, entity = payload))
     })
   })
 
@@ -42,25 +42,25 @@ class HttpClientSpec
 
   "HttpClient" should {
     "be able to perform vast amount of requests" in {
-      val requests = Seq.fill[HttpRequest](numberOfRequests)(Get("/ping"))
+      val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"/ping/$payload") -> payload
 
-      val result = Future.traverse(requests) { r =>
-        client.send(r, "single").flatMap(processResponse(_))
+      val result = Future.traverse(requests) { case (r, p) =>
+        client.send(r, p).flatMap(processResponse(_))
       }
 
       result.map { responses =>
         val exceptions = responses.collect { case (Failure(ex), _) => ex }
         exceptions.length shouldBe 0
 
-        val successful = responses.collect { case (Success(r), m) if r == "pong" && m == "single" => r }
+        val successful = responses.collect { case (Success(r), m) if r == m => r }
         successful.length shouldBe numberOfRequests
       }
     }
     "in opposite to the Source.singe approach" in {
-      val requests = Seq.fill[(HttpRequest, String)](numberOfRequests)(Get("/ping") -> "Source.singe")
+      val requests = for (i <- 1 to numberOfRequests; payload = s"Source.singe$i") yield Get(s"/ping/$payload") -> payload
 
-      val result = Future.traverse(requests) { r =>
-        Source.single(r)
+      val result = Future.traverse(requests) { pair =>
+        Source.single(pair)
           .via(connection)
           .runWith(Sink.head)
           .flatMap(processResponse(_))
@@ -70,12 +70,12 @@ class HttpClientSpec
         val exceptions = responses.collect { case (Failure(ex: akka.stream.BufferOverflowException), _) => ex }
         exceptions.length should be > 0
 
-        val successful = responses.collect { case (Success(r), m) if r == "pong" && m == "Source.singe" => r }
+        val successful = responses.collect { case (Success(r), m) if r == m => r }
         successful.length should be < numberOfRequests
       }
     }
     "be able to return result as a stream" in {
-      val requests = Seq.fill[(HttpRequest, String)](numberOfRequests)(Get("/ping") -> "streaming")
+      val requests = for (i <- 1 to numberOfRequests; payload = s"streaming$i") yield Get(s"/ping/$payload") -> payload
 
       val result = client.send(Source.fromIterator(() => requests.toIterator))
         .mapAsync(1)(processResponse(_)).runWith(Sink.seq)
@@ -84,7 +84,7 @@ class HttpClientSpec
         val exceptions = responses.collect { case (Failure(ex), _) => ex }
         exceptions.length shouldBe 0
 
-        val successful = responses.collect { case (Success(r), m) if r == "pong" && m == "streaming" => r }
+        val successful = responses.collect { case (Success(r), m) if r == m => r }
         successful.length shouldBe numberOfRequests
       }
     }
