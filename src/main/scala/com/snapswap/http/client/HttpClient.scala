@@ -12,15 +12,15 @@ import scala.util.Try
 
 
 object HttpClient {
-  def apply(connection: HttpConnection.Connection,
+  def apply[T](connection: HttpConnection.Connection[T],
             bufferSize: Int,
             overflowStrategy: OverflowStrategy)
            (implicit system: ActorSystem,
-            mat: Materializer): HttpClient =
+            mat: Materializer): HttpClient[T] =
     new HttpClient(connection, bufferSize, overflowStrategy)
 }
 
-class HttpClient(connection: HttpConnection.Connection,
+class HttpClient[T](connection: HttpConnection.Connection[T],
                  bufferSize: Int,
                  overflowStrategy: OverflowStrategy)
                 (implicit system: ActorSystem,

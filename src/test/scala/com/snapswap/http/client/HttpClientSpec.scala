@@ -1,7 +1,9 @@
 package com.snapswap.http.client
 
+import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
+import akka.http.scaladsl.Http.HostConnectionPool
 import akka.http.scaladsl.client.RequestBuilding._
 import akka.http.scaladsl.model.{HttpResponse, StatusCodes}
 import akka.http.scaladsl.server.Directives._
@@ -11,6 +13,7 @@ import akka.stream.scaladsl.{Sink, Source}
 import akka.stream.{ActorMaterializer, Materializer, OverflowStrategy}
 import akka.testkit.TestKit
 import akka.util.Timeout
+import com.snapswap.http.client.HttpConnection.Connection
 import com.typesafe.config.ConfigFactory
 import org.scalatest.{AsyncWordSpecLike, Matchers}
 
@@ -37,55 +40,109 @@ class HttpClientSpec
 
   Http().bindAndHandle(serverRoute, host, port)
 
-  val connection: HttpConnection.Connection = HttpConnection.httpPool(host, port)
-  val client: HttpClient = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
+  "HttpClient" when {
+    "superPool" should {
+      val connection: Connection[NotUsed] = HttpConnection.superPool()
+      val client: HttpClient[NotUsed] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
 
-  "HttpClient" should {
-    "be able to perform vast amount of requests" in {
-      val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"/ping/$payload") -> payload
+      "be able to perform vast amount of requests" in {
+        val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"http://$host:$port/ping/$payload") -> payload
 
-      val result = Future.traverse(requests) { case (r, p) =>
-        client.send(r, p).flatMap(processResponse(_))
+        val result = Future.traverse(requests) { case (r, p) =>
+          client.send(r, p).flatMap(processResponse(_))
+        }
+
+        result.map { responses =>
+          val exceptions = responses.collect { case (Failure(ex), _) => ex }
+          exceptions.length shouldBe 0
+
+          val successful = responses.collect { case (Success(r), m) if r == m => r }
+          successful.length shouldBe numberOfRequests
+        }
       }
+      "in opposite to the Source.singe approach" in {
+        val requests = for (i <- 1 to numberOfRequests; payload = s"Source.singe$i") yield Get(s"http://$host:$port/ping/$payload") -> payload
 
-      result.map { responses =>
-        val exceptions = responses.collect { case (Failure(ex), _) => ex }
-        exceptions.length shouldBe 0
+        val result = Future.traverse(requests) { pair =>
+          Source.single(pair)
+            .via(connection)
+            .runWith(Sink.head)
+            .flatMap(processResponse(_))
+        }
 
-        val successful = responses.collect { case (Success(r), m) if r == m => r }
-        successful.length shouldBe numberOfRequests
+        result.map { responses =>
+          val exceptions = responses.collect { case (Failure(ex: akka.stream.BufferOverflowException), _) => ex }
+          exceptions.length should be > 0
+
+          val successful = responses.collect { case (Success(r), m) if r == m => r }
+          successful.length should be < numberOfRequests
+        }
+      }
+      "be able to return result as a stream" in {
+        val requests = for (i <- 1 to numberOfRequests; payload = s"streaming$i") yield Get(s"http://$host:$port/ping/$payload") -> payload
+
+        val result = client.send(Source.fromIterator(() => requests.toIterator))
+          .mapAsync(1)(processResponse(_)).runWith(Sink.seq)
+
+        result.map { responses =>
+          val exceptions = responses.collect { case (Failure(ex), _) => ex }
+          exceptions.length shouldBe 0
+
+          val successful = responses.collect { case (Success(r), m) if r == m => r }
+          successful.length shouldBe numberOfRequests
+        }
       }
     }
-    "in opposite to the Source.singe approach" in {
-      val requests = for (i <- 1 to numberOfRequests; payload = s"Source.singe$i") yield Get(s"/ping/$payload") -> payload
+    "pool" should {
+      val connection: HttpConnection.Connection[HostConnectionPool] = HttpConnection.httpPool(host, port)
+      val client: HttpClient[HostConnectionPool] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
 
-      val result = Future.traverse(requests) { pair =>
-        Source.single(pair)
-          .via(connection)
-          .runWith(Sink.head)
-          .flatMap(processResponse(_))
+      "be able to perform vast amount of requests" in {
+        val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"/ping/$payload") -> payload
+
+        val result = Future.traverse(requests) { case (r, p) =>
+          client.send(r, p).flatMap(processResponse(_))
+        }
+
+        result.map { responses =>
+          val exceptions = responses.collect { case (Failure(ex), _) => ex }
+          exceptions.length shouldBe 0
+
+          val successful = responses.collect { case (Success(r), m) if r == m => r }
+          successful.length shouldBe numberOfRequests
+        }
       }
+      "in opposite to the Source.singe approach" in {
+        val requests = for (i <- 1 to numberOfRequests; payload = s"Source.singe$i") yield Get(s"/ping/$payload") -> payload
 
-      result.map { responses =>
-        val exceptions = responses.collect { case (Failure(ex: akka.stream.BufferOverflowException), _) => ex }
-        exceptions.length should be > 0
+        val result = Future.traverse(requests) { pair =>
+          Source.single(pair)
+            .via(connection)
+            .runWith(Sink.head)
+            .flatMap(processResponse(_))
+        }
 
-        val successful = responses.collect { case (Success(r), m) if r == m => r }
-        successful.length should be < numberOfRequests
+        result.map { responses =>
+          val exceptions = responses.collect { case (Failure(ex: akka.stream.BufferOverflowException), _) => ex }
+          exceptions.length should be > 0
+
+          val successful = responses.collect { case (Success(r), m) if r == m => r }
+          successful.length should be < numberOfRequests
+        }
       }
-    }
-    "be able to return result as a stream" in {
-      val requests = for (i <- 1 to numberOfRequests; payload = s"streaming$i") yield Get(s"/ping/$payload") -> payload
+      "be able to return result as a stream" in {
+        val requests = for (i <- 1 to numberOfRequests; payload = s"streaming$i") yield Get(s"/ping/$payload") -> payload
 
-      val result = client.send(Source.fromIterator(() => requests.toIterator))
-        .mapAsync(1)(processResponse(_)).runWith(Sink.seq)
+        val result = client.send(Source.fromIterator(() => requests.toIterator))
+          .mapAsync(1)(processResponse(_)).runWith(Sink.seq)
 
-      result.map { responses =>
-        val exceptions = responses.collect { case (Failure(ex), _) => ex }
-        exceptions.length shouldBe 0
+        result.map { responses =>
+          val exceptions = responses.collect { case (Failure(ex), _) => ex }
+          exceptions.length shouldBe 0
 
-        val successful = responses.collect { case (Success(r), m) if r == m => r }
-        successful.length shouldBe numberOfRequests
+          val successful = responses.collect { case (Success(r), m) if r == m => r }
+          successful.length shouldBe numberOfRequests
+        }
       }
     }
   }

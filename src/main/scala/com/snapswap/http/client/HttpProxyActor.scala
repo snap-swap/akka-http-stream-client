@@ -10,7 +10,7 @@ import scala.util.{Failure, Success, Try}
 
 private[client] object HttpProxyActor {
 
-  def props(connection: HttpConnection.Connection,
+  def props[T](connection: HttpConnection.Connection[T],
             bufferSize: Int,
             overflowStrategy: OverflowStrategy)
            (implicit mat: Materializer): Props =
@@ -21,7 +21,7 @@ private[client] object HttpProxyActor {
 }
 
 
-private[client] class HttpProxyActor(connection: HttpConnection.Connection,
+private[client] class HttpProxyActor[T](connection: HttpConnection.Connection[T],
                                      bufferSize: Int,
                                      overflowStrategy: OverflowStrategy)
                                     (implicit mat: Materializer) extends Actor with ActorLogging {

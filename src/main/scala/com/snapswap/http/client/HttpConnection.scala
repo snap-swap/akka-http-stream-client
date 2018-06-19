@@ -1,5 +1,6 @@
 package com.snapswap.http.client
 
+import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.event.LoggingAdapter
 import akka.http.scaladsl.Http.HostConnectionPool
@@ -13,7 +14,7 @@ import scala.util.Try
 
 object HttpConnection {
 
-  type Connection = Flow[(HttpRequest, Any), (Try[HttpResponse], Any), HostConnectionPool]
+  type Connection[T] = Flow[(HttpRequest, Any), (Try[HttpResponse], Any), T]
 
   def defaultConnectionPoolSettings(implicit system: ActorSystem): ConnectionPoolSettings =
     ConnectionPoolSettings(system)
@@ -24,26 +25,29 @@ object HttpConnection {
   def defaultClientHttpsContext(implicit system: ActorSystem): HttpsConnectionContext =
     Http().defaultClientHttpsContext
 
-
   def httpPool(host: String, port: Int)
-              (implicit system: ActorSystem, mat: Materializer): Connection =
+              (implicit system: ActorSystem, mat: Materializer): Connection[HostConnectionPool] =
     Http().cachedHostConnectionPool[Any](host, port)
 
   def httpPool(host: String, port: Int,
                settings: ConnectionPoolSettings,
                log: LoggingAdapter)
-              (implicit system: ActorSystem, mat: Materializer): Connection =
+              (implicit system: ActorSystem, mat: Materializer): Connection[HostConnectionPool] =
     Http().cachedHostConnectionPool[Any](host, port, settings, log)
 
 
   def httpsPool(host: String, port: Int)
-               (implicit system: ActorSystem, mat: Materializer): Connection =
+               (implicit system: ActorSystem, mat: Materializer): Connection[HostConnectionPool] =
     Http().cachedHostConnectionPoolHttps[Any](host, port)
+
+  def superPool()
+               (implicit system: ActorSystem, mat: Materializer): Connection[NotUsed] =
+    Http().superPool[Any]()
 
   def httpsPool(host: String, port: Int,
                 connectionContext: HttpsConnectionContext,
                 settings: ConnectionPoolSettings,
                 log: LoggingAdapter)
-               (implicit system: ActorSystem, mat: Materializer): Connection =
+               (implicit system: ActorSystem, mat: Materializer): Connection[HostConnectionPool] =
     Http().cachedHostConnectionPoolHttps[Any](host, port, connectionContext, settings, log)
 }
