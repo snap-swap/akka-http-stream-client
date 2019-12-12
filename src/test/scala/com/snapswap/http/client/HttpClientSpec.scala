@@ -26,6 +26,11 @@ class HttpClientSpec
 
   import HttpClientSpec._
 
+  override def testConfigSource: String =
+    """
+      |akka.loglevel="ERROR"
+      |""".stripMargin
+
   implicit val timeout: Timeout = Timeout(1.minute)
 
   val serverRoute: Route = get(path("ping" / Segment) { payload =>
