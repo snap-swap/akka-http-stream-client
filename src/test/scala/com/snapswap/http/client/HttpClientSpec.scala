@@ -16,8 +16,7 @@ import org.scalatest.{AsyncWordSpecLike, Matchers}
 
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.{Failure, Success, Try}
-
+import scala.util.{Failure, Random, Success, Try}
 
 class HttpClientSpec
   extends AsyncWordSpecLike
@@ -34,9 +33,10 @@ class HttpClientSpec
   implicit val timeout: Timeout = Timeout(1.minute)
 
   val serverRoute: Route = get(path("ping" / Segment) { payload =>
-    Directives.complete(akka.pattern.after[HttpResponse](responseDelay, system.scheduler) {
-      Future.successful(HttpResponse(StatusCodes.OK, entity = payload))
-    })
+    Directives.complete {
+      val delay = 100 + Random.nextInt(900)
+      akka.pattern.after(delay.millis, system.scheduler)(Future.successful(HttpResponse(StatusCodes.OK, entity = payload)))
+    }
   })
 
   Http().bindAndHandle(serverRoute, host, port)
@@ -154,8 +154,7 @@ class HttpClientSpec
 object HttpClientSpec {
   val host = "0.0.0.0"
   val port = 8000
-  val responseDelay: FiniteDuration = 2.millis
-  val numberOfRequests = 1000
+  val numberOfRequests = 2000
 
   def processResponse[M](r: (Try[HttpResponse], M))
                         (implicit mat: Materializer,
