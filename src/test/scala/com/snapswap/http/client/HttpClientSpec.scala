@@ -27,7 +27,13 @@ class HttpClientSpec
 
   override def testConfigSource: String =
     """
-      |akka.loglevel="ERROR"
+      |akka {
+      |   loglevel="ERROR"
+      |   http.host-connection-pool { //possible hotfix for snap-swap/remote-kyc#494, will increase concurrency for requests so we can handle the peaks
+      |      max-open-requests = 1024
+      |      max-connections = 512
+      |   }
+      |}
       |""".stripMargin
 
   implicit val timeout: Timeout = Timeout(1.minute)
