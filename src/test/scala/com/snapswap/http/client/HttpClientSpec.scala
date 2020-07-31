@@ -3,7 +3,7 @@ package com.snapswap.http.client
 import akka.NotUsed
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.Http.HostConnectionPool
-import akka.http.scaladsl.model.{HttpResponse, StatusCodes}
+import akka.http.scaladsl.model.{HttpRequest, HttpResponse, StatusCodes}
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.{Directives, Route}
 import akka.http.scaladsl.testkit.ScalatestRouteTest
@@ -48,15 +48,43 @@ class HttpClientSpec
   Http().bindAndHandle(serverRoute, host, port)
 
   "HttpClient" when {
+    "not receiving answers" should {
+      "proceed to process other requests" in {
+        val connection: Connection[NotUsed] = HttpConnection.superPool()
+        implicit val client: HttpClient[NotUsed] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
+
+        //it's not possible to reproduce it with the test server, so we'll use real jumio
+        val requests = for (i <- 1 to numberOfRequests) yield {
+          val schema = if (i % 2 == 0) Some("https://") else None //jumio won't reply without schema
+          val url = s"${schema.getOrElse("")}lon.netverify.com/api/v4/initiate"
+          Post(url) -> schema
+        }
+
+        val result = Future.traverse(requests) { case (r, p) =>
+          // println(r.uri)
+          send(r, p).flatMap(processResponse(_))
+        }
+
+        result.map { responses =>
+          val successful = responses.collect { case (Success(r), m) => m -> r }
+          val exceptions = responses.collect { case (Failure(ex), m) => m -> ex }
+
+          requests.length shouldBe numberOfRequests
+          responses.length shouldBe requests.length
+          successful.length shouldBe requests.count { case (_, scheme) => scheme.isDefined }
+          exceptions.length shouldBe requests.count { case (_, scheme) => scheme.isEmpty }
+        }
+      }
+    }
     "superPool" should {
       val connection: Connection[NotUsed] = HttpConnection.superPool()
-      val client: HttpClient[NotUsed] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
+      implicit val client: HttpClient[NotUsed] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
 
       "be able to perform vast amount of requests" in {
         val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"http://$host:$port/ping/$payload") -> payload
 
         val result = Future.traverse(requests) { case (r, p) =>
-          client.send(r, p).flatMap(processResponse(_))
+          send(r, p).flatMap(processResponse(_))
         }
 
         result.map { responses =>
@@ -102,13 +130,13 @@ class HttpClientSpec
     }
     "pool" should {
       val connection: HttpConnection.Connection[HostConnectionPool] = HttpConnection.httpPool(host, port)
-      val client: HttpClient[HostConnectionPool] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
+      implicit val client: HttpClient[HostConnectionPool] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
 
       "be able to perform vast amount of requests" in {
         val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"/ping/$payload") -> payload
 
         val result = Future.traverse(requests) { case (r, p) =>
-          client.send(r, p).flatMap(processResponse(_))
+          send(r, p).flatMap(processResponse(_))
         }
 
         result.map { responses =>
@@ -162,12 +190,21 @@ object HttpClientSpec {
   val port = 8000
   val numberOfRequests = 2000
 
+  def send[M](r: HttpRequest, m: M)
+             (implicit client: HttpClient[_],
+              ec: ExecutionContext): Future[(Try[HttpResponse], M)] = {
+    client.send(r, m)(Timeout(10.seconds)).recover {
+      case ex =>
+        Failure(ex) -> m
+    }
+  }
+
   def processResponse[M](r: (Try[HttpResponse], M))
                         (implicit mat: Materializer,
                          ec: ExecutionContext): Future[(Try[String], M)] = r match {
     case (Success(response), meta) =>
-      Unmarshal(response).to[String].map(Try(_) -> meta)
+      Unmarshal(response).to[String].map(Success(_) -> meta)
     case (Failure(ex), meta) =>
-      Future.successful(Try(throw ex) -> meta)
+      Future.successful(Failure(ex) -> meta)
   }
 }
