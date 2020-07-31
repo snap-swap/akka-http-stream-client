@@ -49,21 +49,35 @@ class HttpClientSpec
 
   "HttpClient" when {
     "not receiving answers" should {
-      "proceed to process other requests" in {
-        val connection: Connection[NotUsed] = HttpConnection.superPool()
-        implicit val client: HttpClient[NotUsed] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
+      val connection: Connection[NotUsed] = HttpConnection.superPool()
+      implicit val client: HttpClient[NotUsed] = HttpClient(connection, Int.MaxValue, OverflowStrategy.dropNew)
 
-        //it's not possible to reproduce it with the test server, so we'll use real jumio
-        val requests = for (i <- 1 to numberOfRequests) yield {
-          val schema = if (i % 2 == 0) Some("https://") else None //jumio won't reply without schema
-          val url = s"${schema.getOrElse("")}lon.netverify.com/api/v4/initiate"
-          Post(url) -> schema
-        }
+      //it's not possible to reproduce it with the test server, so we'll use real jumio
+      val requests = for (i <- 1 to numberOfRequests) yield {
+        val schema = if (i % 2 == 0) Some("https://") else None //jumio won't reply without schema
+        val url = s"${schema.getOrElse("")}lon.netverify.com/api/v4/initiate"
+        Post(url) -> schema
+      }
 
+      "proceed to process other requests in 'Future (one request)' mode" in {
         val result = Future.traverse(requests) { case (r, p) =>
           // println(r.uri)
           send(r, p).flatMap(processResponse(_))
         }
+
+        result.map { responses =>
+          val successful = responses.collect { case (Success(r), m) => m -> r }
+          val exceptions = responses.collect { case (Failure(ex), m) => m -> ex }
+
+          requests.length shouldBe numberOfRequests
+          responses.length shouldBe requests.length
+          successful.length shouldBe requests.count { case (_, scheme) => scheme.isDefined }
+          exceptions.length shouldBe requests.count { case (_, scheme) => scheme.isEmpty }
+        }
+      }
+      "proceed to process other requests in 'Stream' mode" in {
+        val result = client.send(Source(requests.toList))
+          .mapAsync(1)(processResponse(_)).runWith(Sink.seq)
 
         result.map { responses =>
           val successful = responses.collect { case (Success(r), m) => m -> r }
