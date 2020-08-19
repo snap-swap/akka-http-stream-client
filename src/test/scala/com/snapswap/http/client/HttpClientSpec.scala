@@ -37,7 +37,7 @@ class HttpClientSpec
     "failure occurred in the connection pool flow (requests processing stream failed)" should {
       implicit val client: HttpClient = HttpClient(
         connectionParams = SuperPool,
-        requestTimeout = 120.seconds
+        requestTimeout = 3.seconds //decrease it as much as possible just not to wait tests completion too long
       )
       val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield {
         val uri = Uri(s"http://$host:$port/ping/$payload")
@@ -77,10 +77,9 @@ class HttpClientSpec
         }
       }
     }
-    "superPool" should {
+    "using superPool" should {
       implicit val client: HttpClient = HttpClient(
-        connectionParams = SuperPool,
-        requestTimeout = 120.seconds
+        connectionParams = SuperPool
       )
       val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"http://$host:$port/ping/$payload") -> payload
 
@@ -97,7 +96,7 @@ class HttpClientSpec
           successful.length shouldBe numberOfRequests
         }
       }
-      "in opposite to the Source.singe approach" in {
+      "in opposite to the Source.singe approach" in { //indicates that requests outside the pool capacity will be failed if they are performing simultaneously
         val connection = Http().superPool[Any]()
         val result = Future.traverse(requests) { pair =>
           Source.single(pair)
@@ -127,10 +126,9 @@ class HttpClientSpec
         }
       }
     }
-    "pool" should {
+    "using pool" should {
       implicit val client: HttpClient = HttpClient(
-        connectionParams = HttpConnectionParams(host, port),
-        requestTimeout = 120.seconds
+        connectionParams = HttpConnectionParams(host, port)
       )
       val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"/ping/$payload") -> payload
 
@@ -168,7 +166,7 @@ class HttpClientSpec
 object HttpClientSpec {
   val host = "0.0.0.0"
   val port = 8000
-  val numberOfRequests = 2000
+  val numberOfRequests = 2000 //should be greater host-connection-pool.max-connections to test that we can process requests outside the pool capacity
 
   def send[M](r: Source[(HttpRequest, M), Any])
              (implicit client: HttpClient,

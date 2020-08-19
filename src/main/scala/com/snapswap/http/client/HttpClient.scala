@@ -13,7 +13,7 @@ import com.snapswap.http.client.model.{EnrichedRequest, EnrichedResponse, Reques
 
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success, Try}
+import scala.util.{Failure, Random, Success, Try}
 
 
 object HttpClient {
@@ -21,7 +21,7 @@ object HttpClient {
             connectionParams: ConnectionParams = SuperPool,
             poolSettings: Option[ConnectionPoolSettings] = None,
             logger: Option[LoggingAdapter] = None,
-            bufferSize: Int = Int.MaxValue,
+            bufferSize: Int = 1000,
             requestTimeout: FiniteDuration = 20.seconds)
            (implicit system: ActorSystem,
             ec: ExecutionContext,
@@ -49,19 +49,15 @@ class HttpClient(connectionContext: HttpsConnectionContext,
                 (implicit system: ActorSystem,
                  ec: ExecutionContext,
                  mat: Materializer) {
-  /**
-   * Affects only our consumers which only push requests to the pool and then fan out incomplete requests.
-   * Actually pool has it own parallelism which can be configured in the akka.http.host-connection-pool section
-   * and calculated as poolSettings.pipeliningLimit * poolSettings.maxConnections
-   **/
-  private val consumingParallelism = Int.MaxValue
 
-  /**
-   * Affects real responses processing:
-   *  - complete incomplete request by real response from pool
-   *  - emit complete request to the outgoing stream
-   **/
-  private val resultsProcessingParallelism = Int.MaxValue
+  private val baseRetryDelay: FiniteDuration = 50.millis //TODO: make it configurable
+
+  private def retryDelay: FiniteDuration =
+    FiniteDuration((baseRetryDelay.length * Random.nextFloat).toLong, baseRetryDelay.unit) + baseRetryDelay
+
+
+  //Affects only our consumers which only push requests to the pool, let it be the same as for the pool
+  private val consumingParallelism = poolSettings.pipeliningLimit * poolSettings.maxConnections
 
   private val log = logger.getOrElse(Logging.getLogger(system, this.getClass.getSimpleName))
 
@@ -77,19 +73,30 @@ class HttpClient(connectionContext: HttpsConnectionContext,
   }
 
   private val in: SourceQueueWithComplete[RequestWithCompletion] = {
-    val (inQueue, processingFlow) = Source.queue[RequestWithCompletion](bufferSize, OverflowStrategy.backpressure)
+    val (inQueue, processingFlow) = Source.queue[RequestWithCompletion](bufferSize, OverflowStrategy.dropNew) //to indicate that buffer is full
       .preMaterialize()
 
     processingFlow
       .map(requestWithCompletion => requestWithCompletion.httpRequest -> requestWithCompletion)
       //TODO: no needless to do it right now but remember, we can use throttling here
       .via(pool)
-      .mapAsyncUnordered(resultsProcessingParallelism) { case (response, requestWithCompletion) =>
-        requestWithCompletion.completeWithResult(response).map {
-          case Failure(ex) =>
-            log.error(ex, s"exception during processing request ${requestWithCompletion.id}")
-          case Success(resp) =>
-            log.debug(s"request ${requestWithCompletion.id} was completed with ${resp.status}")
+      //parallelism here already restricted by pool parallelism, so no need to put specific value here
+      .mapAsyncUnordered(Int.MaxValue) { case (response, requestWithCompletion) =>
+        requestWithCompletion.completeWithResult(response).map { underlyingResult =>
+          underlyingResult -> response match {
+            case (Failure(underlyingEx), Success(resp)) =>
+              log.error(underlyingEx, s"got http response ${resp.status} but request ${requestWithCompletion.id} itself has been already failed")
+            case (Failure(underlyingEx), Failure(ex)) if !underlyingEx.equals(ex) =>
+              log.error(ex, s"exception during processing request ${requestWithCompletion.id}, but request was failed with another error $underlyingEx")
+            case (Failure(underlyingEx), Failure(_)) =>
+              log.error(underlyingEx, s"request ${requestWithCompletion.id} was failed")
+            case (Success(underlyingResp), Failure(ex)) =>
+              log.error(ex, s"exception during processing request ${requestWithCompletion.id}, but request somehow is completed with ${underlyingResp.status}")
+            case (Success(underlyingResp), Success(resp)) if !underlyingResp.equals(resp) =>
+              log.error(s"request ${requestWithCompletion.id} completion result is differ from the response (${underlyingResp.status} -> ${resp.status})")
+            case (Success(underlyingResp), Success(_)) =>
+              log.debug(s"request ${requestWithCompletion.id} was completed with ${underlyingResp.status}")
+          }
         }
       }
       .to(Sink.ignore)
@@ -115,8 +122,34 @@ class HttpClient(connectionContext: HttpsConnectionContext,
   def send[M](request: EnrichedRequest[M]): Future[EnrichedResponse[M]] =
     send(Source.single(request)).runWith(Sink.head)
 
+  /**
+   * Here we implement backpressure mechanism to be able to offer elements from the different sources.
+   * Standard OverflowStrategy.backpressure with SourceQueue works only if we offer elements only from one place
+   * */
+  private def offerIn[M](req: EnrichedRequestWithTimeout[M]): Future[Future[EnrichedResponse[M]]] = {
+    if (req.awaitingResponse.isCompleted)
+      req.awaitingResponse.map {
+        case EnrichedResponse(Success(resp), _) =>
+          log.error(s"request ${req.id} somehow already completed with ${resp.status}, no need to send it to the pool")
+        case EnrichedResponse(Failure(ex), _) =>
+          log.error(ex, s"request ${req.id} already completed with failure, no need to send it to the pool")
+      }.map(_ => req.awaitingResponse)
+    else
+      in.offer(req).flatMap {
+        case QueueOfferResult.Enqueued =>
+          log.debug(s"Request ${req.id} Enqueued")
+          Future.successful(req.awaitingResponse)
+        case QueueOfferResult.Dropped => //buffer is full, need to wait and offer again
+          val delay = retryDelay
+          log.warning(s"pool buffer size is $bufferSize and seems it's overflowed, will try to offer request ${req.id} after $delay")
+          akka.pattern.after(delay, system.scheduler)(offerIn(req))
+        case result =>
+          Future.failed(HttpClientError(s"expected Enqueued result for 'in' but got $result for request ${req.id}"))
+      }
+  }
+
   def send[M](requests: Source[EnrichedRequest[M], Any]): Source[EnrichedResponse[M], Any] = {
-    val (out, result) = Source.queue[Future[EnrichedResponse[M]]](bufferSize, OverflowStrategy.backpressure)
+    val (out, result) = Source.queue[Future[EnrichedResponse[M]]](1, OverflowStrategy.backpressure)
       .preMaterialize()
 
     requests
@@ -126,20 +159,17 @@ class HttpClient(connectionContext: HttpsConnectionContext,
         EnrichedRequestWithTimeout(req, requestTimeout)
       }
       .mapAsyncUnordered(consumingParallelism) { req =>
-        //send requests to the pool - one by one and then return incomplete future with response
-        in.offer(req).map {
-          case QueueOfferResult.Enqueued =>
-            req.id -> req.awaitingResponse
-          case result =>
-            throw HttpClientError(s"expected Enqueued result for 'in' but got $result for request ${req.id}")
-        }.recover {
-          case ex =>
-            log.error(ex, s"can't send request ${req.id} to the pool, will fail it")
-            req.id -> req.completeIfIncomplete(Failure(ex))
-        }
+        //send requests to the pool - and then return incomplete future with response
+        offerIn(req)
+          .map { response => req.id -> response }
+          .recover {
+            case ex =>
+              log.error(ex, s"can't send request ${req.id} to the pool, will fail it")
+              req.id -> req.completeIfIncomplete(Failure(ex))
+          }
       }
-      .mapAsyncUnordered(resultsProcessingParallelism) { case (id, resp) =>
-        //send back to the client response (may be incomplete) immediately
+      .mapAsyncUnordered(1) { case (id, resp) => //parallelism should be always 1 here to make backpressure strategy work
+        //send back response (may be incomplete) immediately
         out.offer(resp).map {
           case QueueOfferResult.Enqueued =>
           case result =>
@@ -150,8 +180,14 @@ class HttpClient(connectionContext: HttpsConnectionContext,
         }
       }
       .zipWith(result
-        //wait for the response readiness and then emit it
-        .mapAsyncUnordered(resultsProcessingParallelism)(awaitingResponse => awaitingResponse)
+
+        /**
+         * wait for the response readiness and then emit it
+         * Note that all elements in 'result' are from 'out',
+         * and they will be offered to 'out' only after they will be enqueued by 'in',
+         * so no need to restrict concurrency (parallelism) here
+         **/
+        .mapAsyncUnordered(Int.MaxValue)(awaitingResponse => awaitingResponse)
       ) { case (_, response) => response }
   }
 
