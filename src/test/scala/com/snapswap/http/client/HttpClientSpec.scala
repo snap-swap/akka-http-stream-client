@@ -38,7 +38,7 @@ class HttpClientSpec
     "failure occurred in the connection pool flow (requests processing stream failed)" should {
       implicit val client: HttpClient = HttpClient(connectionParams = SuperPool)
       //let's setup it small not to wait too long for the tests completion, in the real life it should be greater, maybe 10-20 sec
-      implicit val requestTimeout: Timeout = 1.seconds
+      implicit val requestTimeout: Timeout = 3.seconds
 
       val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield {
         val uri = Uri(s"http://$host:$port/ping/$payload")
