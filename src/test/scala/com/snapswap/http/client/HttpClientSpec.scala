@@ -9,6 +9,7 @@ import akka.http.scaladsl.testkit.ScalatestRouteTest
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream.Materializer
 import akka.stream.scaladsl.{Sink, Source}
+import akka.util.Timeout
 import com.snapswap.http.client.ConnectionParams.{HttpConnectionParams, SuperPool}
 import com.snapswap.http.client.model.{EnrichedRequest, EnrichedResponse}
 import org.scalatest.{AsyncWordSpecLike, Matchers}
@@ -35,10 +36,10 @@ class HttpClientSpec
 
   "HttpClient" when {
     "failure occurred in the connection pool flow (requests processing stream failed)" should {
-      implicit val client: HttpClient = HttpClient(
-        connectionParams = SuperPool,
-        requestTimeout = 3.seconds //decrease it as much as possible just not to wait tests completion too long
-      )
+      implicit val client: HttpClient = HttpClient(connectionParams = SuperPool)
+      //let's setup it small not to wait too long for the tests completion, in the real life it should be greater, maybe 10-20 sec
+      implicit val requestTimeout: Timeout = 1.seconds
+
       val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield {
         val uri = Uri(s"http://$host:$port/ping/$payload")
         if (i % 2 == 0)
@@ -78,9 +79,9 @@ class HttpClientSpec
       }
     }
     "using superPool" should {
-      implicit val client: HttpClient = HttpClient(
-        connectionParams = SuperPool
-      )
+      implicit val client: HttpClient = HttpClient(connectionParams = SuperPool)
+      implicit val requestTimeout: Timeout = 20.seconds
+
       val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"http://$host:$port/ping/$payload") -> payload
 
       "be able to perform vast amount of requests" in {
@@ -127,9 +128,9 @@ class HttpClientSpec
       }
     }
     "using pool" should {
-      implicit val client: HttpClient = HttpClient(
-        connectionParams = HttpConnectionParams(host, port)
-      )
+      implicit val client: HttpClient = HttpClient(connectionParams = HttpConnectionParams(host, port))
+      implicit val requestTimeout: Timeout = 20.seconds
+
       val requests = for (i <- 1 to numberOfRequests; payload = s"single$i") yield Get(s"/ping/$payload") -> payload
 
       "be able to perform vast amount of requests" in {
@@ -170,13 +171,15 @@ object HttpClientSpec {
 
   def send[M](r: Source[(HttpRequest, M), Any])
              (implicit client: HttpClient,
-              ec: ExecutionContext): Source[(Try[HttpResponse], M), Any] =
+              ec: ExecutionContext,
+              requestTimeout: Timeout): Source[(Try[HttpResponse], M), Any] =
     client.send(r.map { case (r, m) => EnrichedRequest(r, m) })
       .map { case EnrichedResponse(response, EnrichedRequest(_, meta, _)) => response -> meta }
 
   def send[M](r: HttpRequest, m: M)
              (implicit client: HttpClient,
-              ec: ExecutionContext): Future[(Try[HttpResponse], M)] = {
+              ec: ExecutionContext,
+              requestTimeout: Timeout): Future[(Try[HttpResponse], M)] = {
     client.send(r, m).recover {
       case ex =>
         Failure(ex) -> m

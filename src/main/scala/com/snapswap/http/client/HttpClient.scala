@@ -7,6 +7,7 @@ import akka.http.scaladsl.settings.ConnectionPoolSettings
 import akka.http.scaladsl.{Http, HttpsConnectionContext}
 import akka.stream._
 import akka.stream.scaladsl.{Sink, Source, SourceQueueWithComplete}
+import akka.util.Timeout
 import com.snapswap.http.client.ConnectionParams.{HttpConnectionParams, HttpsConnectionParams, SuperPool}
 import com.snapswap.http.client.HttpClient.HttpClientError
 import com.snapswap.http.client.model.{EnrichedRequest, EnrichedResponse, RequestId}
@@ -21,8 +22,7 @@ object HttpClient {
             connectionParams: ConnectionParams = SuperPool,
             poolSettings: Option[ConnectionPoolSettings] = None,
             logger: Option[LoggingAdapter] = None,
-            bufferSize: Int = 1000,
-            requestTimeout: FiniteDuration = 20.seconds)
+            bufferSize: Int = 1000)
            (implicit system: ActorSystem,
             ec: ExecutionContext,
             mat: Materializer): HttpClient =
@@ -30,8 +30,7 @@ object HttpClient {
       connectionParams = connectionParams,
       poolSettings = poolSettings.getOrElse(ConnectionPoolSettings(system)),
       logger = logger,
-      bufferSize = bufferSize,
-      requestTimeout = requestTimeout
+      bufferSize = bufferSize
     )
 
   case class HttpClientError(message: String) extends Throwable {
@@ -44,8 +43,7 @@ class HttpClient(connectionContext: HttpsConnectionContext,
                  connectionParams: ConnectionParams,
                  poolSettings: ConnectionPoolSettings,
                  logger: Option[LoggingAdapter],
-                 bufferSize: Int,
-                 requestTimeout: FiniteDuration)
+                 bufferSize: Int)
                 (implicit system: ActorSystem,
                  ec: ExecutionContext,
                  mat: Materializer) {
@@ -54,7 +52,6 @@ class HttpClient(connectionContext: HttpsConnectionContext,
 
   private def retryDelay: FiniteDuration =
     FiniteDuration((baseRetryDelay.length * Random.nextFloat).toLong, baseRetryDelay.unit) + baseRetryDelay
-
 
   //Affects only our consumers which only push requests to the pool, let it be the same as for the pool
   private val consumingParallelism = poolSettings.pipeliningLimit * poolSettings.maxConnections
@@ -110,22 +107,25 @@ class HttpClient(connectionContext: HttpsConnectionContext,
     inQueue
   }
 
-  def send(request: HttpRequest): Future[Try[HttpResponse]] =
+  def send(request: HttpRequest)
+          (implicit requestTimeout: Timeout): Future[Try[HttpResponse]] =
     send(EnrichedRequest(request)).map(_.response)
 
-  def send[M](request: HttpRequest, meta: M): Future[(Try[HttpResponse], M)] =
+  def send[M](request: HttpRequest, meta: M)
+             (implicit requestTimeout: Timeout): Future[(Try[HttpResponse], M)] =
     send(EnrichedRequest(request, meta)).map {
       case EnrichedResponse(response, EnrichedRequest(_, meta, _)) =>
         response -> meta
     }
 
-  def send[M](request: EnrichedRequest[M]): Future[EnrichedResponse[M]] =
+  def send[M](request: EnrichedRequest[M])
+             (implicit requestTimeout: Timeout): Future[EnrichedResponse[M]] =
     send(Source.single(request)).runWith(Sink.head)
 
   /**
    * Here we implement backpressure mechanism to be able to offer elements from the different sources.
    * Standard OverflowStrategy.backpressure with SourceQueue works only if we offer elements only from one place
-   * */
+   **/
   private def offerIn[M](req: EnrichedRequestWithTimeout[M]): Future[Future[EnrichedResponse[M]]] = {
     if (req.awaitingResponse.isCompleted)
       req.awaitingResponse.map {
@@ -148,7 +148,8 @@ class HttpClient(connectionContext: HttpsConnectionContext,
       }
   }
 
-  def send[M](requests: Source[EnrichedRequest[M], Any]): Source[EnrichedResponse[M], Any] = {
+  def send[M](requests: Source[EnrichedRequest[M], Any])
+             (implicit requestTimeout: Timeout): Source[EnrichedResponse[M], Any] = {
     val (out, result) = Source.queue[Future[EnrichedResponse[M]]](1, OverflowStrategy.backpressure)
       .preMaterialize()
 
@@ -156,7 +157,7 @@ class HttpClient(connectionContext: HttpsConnectionContext,
       .map { req =>
         log.debug(s"got new request ${req.id} ${req.request.method.value} ${req.request.uri.toString()}")
         //start ticking timeout for all requests
-        EnrichedRequestWithTimeout(req, requestTimeout)
+        EnrichedRequestWithTimeout(req, requestTimeout.duration)
       }
       .mapAsyncUnordered(consumingParallelism) { req =>
         //send requests to the pool - and then return incomplete future with response
