@@ -2,7 +2,7 @@ name := "akka-http-stream-client"
 
 organization := "com.snapswap"
 
-version := "0.2.0"
+version := "0.2.1"
 
 val scalaV11 = "2.11.11"
 val scalaV13 = "2.13.1"

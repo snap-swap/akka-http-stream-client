@@ -218,7 +218,10 @@ class HttpClient(connectionContext: HttpsConnectionContext,
     def completeIfIncomplete(response: Try[HttpResponse]): Future[EnrichedResponse[M]] = {
       scheduledFailure.cancel()
       if (countdownResponse.isCompleted)
-        countdownResponse.future
+        response.map(_.discardEntityBytes().future()).getOrElse(Future.successful(())).recover {
+          case ex =>
+            log.error(ex, s"request ${rr.id} has been already completed but response arrived and we discarded entity bytes and something went wrong here!")
+        }.flatMap(_ => countdownResponse.future)
       else
         countdownResponse.complete(Success(EnrichedResponse(response, rr))).future
     }
