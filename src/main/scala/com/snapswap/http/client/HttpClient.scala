@@ -114,7 +114,7 @@ class HttpClient(connectionContext: HttpsConnectionContext,
   def send[M](request: HttpRequest, meta: M)
              (implicit requestTimeout: Timeout): Future[(Try[HttpResponse], M)] =
     send(EnrichedRequest(request, meta)).map {
-      case EnrichedResponse(response, EnrichedRequest(_, meta, _)) =>
+      case EnrichedResponse(response, EnrichedRequest(_, meta, _, _), _) =>
         response -> meta
     }
 
@@ -129,9 +129,9 @@ class HttpClient(connectionContext: HttpsConnectionContext,
   private def offerIn[M](req: EnrichedRequestWithTimeout[M]): Future[Future[EnrichedResponse[M]]] = {
     if (req.awaitingResponse.isCompleted)
       req.awaitingResponse.map {
-        case EnrichedResponse(Success(resp), _) =>
+        case EnrichedResponse(Success(resp), _, _) =>
           log.error(s"request ${req.id} somehow already completed with ${resp.status}, no need to send it to the pool")
-        case EnrichedResponse(Failure(ex), _) =>
+        case EnrichedResponse(Failure(ex), _, _) =>
           log.error(ex, s"request ${req.id} already completed with failure, no need to send it to the pool")
       }.map(_ => req.awaitingResponse)
     else
@@ -230,7 +230,7 @@ class HttpClient(connectionContext: HttpsConnectionContext,
 
     def completeWithResult(response: Try[HttpResponse]): Future[Try[HttpResponse]] =
       completeIfIncomplete(response).map {
-        case EnrichedResponse(result, _) => result
+        case EnrichedResponse(result, _, _) => result
       }
   }
 

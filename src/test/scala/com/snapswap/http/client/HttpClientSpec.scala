@@ -174,7 +174,7 @@ object HttpClientSpec {
               ec: ExecutionContext,
               requestTimeout: Timeout): Source[(Try[HttpResponse], M), Any] =
     client.send(r.map { case (r, m) => EnrichedRequest(r, m) })
-      .map { case EnrichedResponse(response, EnrichedRequest(_, meta, _)) => response -> meta }
+      .map { case EnrichedResponse(response, EnrichedRequest(_, meta, _, _), _) => response -> meta }
 
   def send[M](r: HttpRequest, m: M)
              (implicit client: HttpClient,
