@@ -1,5 +1,7 @@
 package com.snapswap.http.client
 
+import java.time.Instant
+
 import akka.actor.ActorSystem
 import akka.event.{Logging, LoggingAdapter}
 import akka.http.scaladsl.model.{HttpRequest, HttpResponse, RequestTimeoutException}
@@ -80,19 +82,19 @@ class HttpClient(connectionContext: HttpsConnectionContext,
       //parallelism here already restricted by pool parallelism, so no need to put specific value here
       .mapAsyncUnordered(Int.MaxValue) { case (response, requestWithCompletion) =>
         requestWithCompletion.completeWithResult(response).map { underlyingResult =>
-          underlyingResult -> response match {
+          underlyingResult.response -> response match {
             case (Failure(underlyingEx), Success(resp)) =>
-              log.error(underlyingEx, s"got http response ${resp.status} but request ${requestWithCompletion.id} itself has been already failed")
+              log.error(underlyingEx, s"got http response ${resp.status} but request $requestWithCompletion itself has been already failed")
             case (Failure(underlyingEx), Failure(ex)) if !underlyingEx.equals(ex) =>
-              log.error(ex, s"exception during processing request ${requestWithCompletion.id}, but request was failed with another error $underlyingEx")
+              log.error(ex, s"exception during processing request $requestWithCompletion, but request was failed with another error $underlyingEx")
             case (Failure(underlyingEx), Failure(_)) =>
-              log.error(underlyingEx, s"request ${requestWithCompletion.id} was failed")
+              log.error(underlyingEx, s"request $requestWithCompletion was failed")
             case (Success(underlyingResp), Failure(ex)) =>
-              log.error(ex, s"exception during processing request ${requestWithCompletion.id}, but request somehow is completed with ${underlyingResp.status}")
+              log.error(ex, s"exception during processing request $requestWithCompletion, but request somehow was completed with ${underlyingResp.status}")
             case (Success(underlyingResp), Success(resp)) if !underlyingResp.equals(resp) =>
-              log.error(s"request ${requestWithCompletion.id} completion result is differ from the response (${underlyingResp.status} -> ${resp.status})")
+              log.error(s"request $requestWithCompletion completion result is differ from the response (${underlyingResp.status} -> ${resp.status})")
             case (Success(underlyingResp), Success(_)) =>
-              log.debug(s"request ${requestWithCompletion.id} was completed with ${underlyingResp.status}")
+              log.debug(s"request $requestWithCompletion was completed with ${underlyingResp.status} in ${underlyingResult.duration}")
           }
         }
       }
@@ -130,21 +132,21 @@ class HttpClient(connectionContext: HttpsConnectionContext,
     if (req.awaitingResponse.isCompleted)
       req.awaitingResponse.map {
         case EnrichedResponse(Success(resp), _, _) =>
-          log.error(s"request ${req.id} somehow already completed with ${resp.status}, no need to send it to the pool")
+          log.error(s"request $req somehow already completed with ${resp.status}, no need to send it to the pool")
         case EnrichedResponse(Failure(ex), _, _) =>
-          log.error(ex, s"request ${req.id} already completed with failure, no need to send it to the pool")
+          log.error(ex, s"request $req already completed with failure, no need to send it to the pool")
       }.map(_ => req.awaitingResponse)
     else
       in.offer(req).flatMap {
         case QueueOfferResult.Enqueued =>
-          log.debug(s"Request ${req.id} Enqueued")
+          log.debug(s"Request $req Enqueued")
           Future.successful(req.awaitingResponse)
         case QueueOfferResult.Dropped => //buffer is full, need to wait and offer again
           val delay = retryDelay
-          log.warning(s"pool buffer size is $bufferSize and seems it's overflowed, will try to offer request ${req.id} after $delay")
+          log.warning(s"pool buffer size is $bufferSize and seems it's overflowed, will try to offer request $req after $delay")
           akka.pattern.after(delay, system.scheduler)(offerIn(req))
         case result =>
-          Future.failed(HttpClientError(s"expected Enqueued result for 'in' but got $result for request ${req.id}"))
+          Future.failed(HttpClientError(s"expected Enqueued result for 'in' but got $result for request $req"))
       }
   }
 
@@ -155,9 +157,9 @@ class HttpClient(connectionContext: HttpsConnectionContext,
 
     requests
       .map { req =>
-        log.debug(s"got new request ${req.id} ${req.request.method.value} ${req.request.uri.toString()}")
-        //start ticking timeout for all requests
-        EnrichedRequestWithTimeout(req, requestTimeout.duration)
+        log.debug(s"got new request [${req.id}] ${req.request.method.value} ${req.request.uri.toString()}")
+        //start ticking timeout for all requests, copy request with the actual current timestamp to be precise
+        EnrichedRequestWithTimeout(req.copy(timestamp = Instant.now()), requestTimeout.duration)
       }
       .mapAsyncUnordered(consumingParallelism) { req =>
         //send requests to the pool - and then return incomplete future with response
@@ -165,7 +167,7 @@ class HttpClient(connectionContext: HttpsConnectionContext,
           .map { response => req.id -> response }
           .recover {
             case ex =>
-              log.error(ex, s"can't send request ${req.id} to the pool, will fail it")
+              log.error(ex, s"can't send request $req to the pool, will fail it")
               req.id -> req.completeIfIncomplete(Failure(ex))
           }
       }
@@ -197,10 +199,15 @@ class HttpClient(connectionContext: HttpsConnectionContext,
 
     def id: RequestId
 
-    def completeWithResult(response: Try[HttpResponse]): Future[Try[HttpResponse]]
+    def completeWithResult(response: Try[HttpResponse]): Future[EnrichedResponse[_]]
+
+    override def toString: String =
+      s"[$id] ${httpRequest.method.value} ${httpRequest.uri.toString()}"
   }
 
   private case class EnrichedRequestWithTimeout[M](rr: EnrichedRequest[M], timeout: FiniteDuration) extends RequestWithCompletion {
+    override def toString: String = super.toString
+
     private val countdownResponse = Promise.apply[EnrichedResponse[M]]()
     private val scheduledFailure = system.scheduler.scheduleOnce(timeout) {
       countdownResponse.complete(
@@ -220,7 +227,7 @@ class HttpClient(connectionContext: HttpsConnectionContext,
       if (countdownResponse.isCompleted)
         response.map(_.discardEntityBytes().future()).getOrElse(Future.successful(())).recover {
           case ex =>
-            log.error(ex, s"request ${rr.id} has been already completed but response arrived and we discarded entity bytes and something went wrong here!")
+            log.error(ex, s"request $rr has been already completed but response arrived and we discarded entity bytes and something went wrong here!")
         }.flatMap(_ => countdownResponse.future)
       else
         countdownResponse.complete(Success(EnrichedResponse(response, rr))).future
@@ -228,10 +235,8 @@ class HttpClient(connectionContext: HttpsConnectionContext,
 
     def awaitingResponse: Future[EnrichedResponse[M]] = countdownResponse.future
 
-    def completeWithResult(response: Try[HttpResponse]): Future[Try[HttpResponse]] =
-      completeIfIncomplete(response).map {
-        case EnrichedResponse(result, _, _) => result
-      }
+    def completeWithResult(response: Try[HttpResponse]): Future[EnrichedResponse[_]] =
+      completeIfIncomplete(response)
   }
 
 }
